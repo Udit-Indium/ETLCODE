@@ -1,0 +1,19 @@
+google-adk==2.7.1
+litellm==1.98.0
+python-dotenv==1.2.3
+requests==2.34.2
+nbformat==5.11.1
+numpy==2.5.2
+pandas==3.0.5
+pytest==9.1.1
+
+# SEMS Static Analysis Tools
+black
+isort
+flake8
+pylint
+mypy
+bandit
+radon
+pydocstyle
+pytest-cov

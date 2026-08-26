@@ -1,0 +1,109 @@
+# pylint configuration aligned with SonarQube Python profile (Sonar Way)
+# Maps to: Reliability (Bugs), Maintainability (Code Smells)
+# Used by: src/pre_sonar_check.py
+
+[MASTER]
+jobs = 1
+unsafe-load-any-extension = no
+
+[MESSAGES CONTROL]
+# Disable checks covered by other tools or not in SonarQube Sonar Way
+disable =
+    C0114,      # missing-module-docstring     → handled by pydocstyle
+    C0115,      # missing-class-docstring      → handled by pydocstyle
+    C0116,      # missing-function-docstring   → handled by pydocstyle
+    C0301,      # line-too-long                → handled by flake8 E501
+    W0105,      # pointless-string-statement
+    R0903,      # too-few-public-methods       → not enforced by SonarQube
+    W0212,      # protected-access             → PySpark internals need this
+    R0801,      # duplicate-code               → tracked by SEMS DUP001 instead: pylint's
+                #                                 checker only compares across multiple files,
+                #                                 never within one, so it can't see the
+                #                                 single-file case DUP001 is built for.
+    W0511,      # fixme                        → informational only
+    C0411,      # wrong-import-order           → handled by isort
+    C0412,      # ungrouped-imports            → handled by isort
+    C0413,      # wrong-import-position        → handled by isort
+    E1121,      # too-many-function-args       → PySpark dynamic signatures cause false positives
+    E1130,      # invalid-unary-operand-type   → PySpark Column.__invert__ (~col) is valid
+    W0404,      # reimported                   → false positive for Databricks cell format (each cell re-imports)
+    W0622,      # redefined-builtin            → pyspark.sql.functions.max/min/sum shadow builtins by design
+    W0718,      # broad-exception-caught       → SEMS ERR001/ERR002 already enforces this; no double-counting
+    W1203,      # logging-fstring-interpolation → cosmetic; LLM prompt guidance handles this
+    W0621,      # redefined-outer-name         → common pattern across Databricks notebook cells
+    C0302,      # too-many-lines               → assembled multi-cell notebooks are inherently long
+    C0415,      # import-outside-toplevel      → PySpark broadcast and cluster-mode imports require this
+    R0913,      # too-many-arguments           → pipeline orchestrators need many params by design
+    R0914,      # too-many-locals              → same
+    R0915,      # too-many-statements          → same
+    C0103,      # invalid-name                 → cosmetic; naming conventions enforced elsewhere
+
+# Explicitly enable checks that map to SonarQube BUG category
+enable =
+    E0001,      # syntax-error
+    E0100,      # init-is-generator
+    E0101,      # return-in-init
+    E0102,      # function-redefined
+    E0103,      # break-outside-loop
+    E0104,      # continue-outside-loop
+    E0107,      # nonexistent-operator
+    E0110,      # abstract-class-instantiated
+    E0401,      # import-error
+    E1101,      # no-member
+    E1120,      # no-value-for-argument
+    E1123,      # unexpected-keyword-arg
+    W0601,      # global-variable-undefined
+    W0611,      # unused-import
+    W0612,      # unused-variable
+    W0613,      # unused-argument
+    # W0621 and W0622 are in the disable list above — do not re-enable here
+    W1510,      # subprocess-run-check
+
+[FORMAT]
+max-line-length = 120
+indent-string = "    "
+indent-after-paren = 4
+expected-line-ending-format = LF
+
+[DESIGN]
+# SonarQube cognitive complexity threshold is 15; cyclomatic ~= 10
+max-args = 7
+max-attributes = 10
+max-bool-expr = 5
+max-branches = 12
+max-locals = 15
+max-returns = 6
+max-statements = 50
+min-public-methods = 0
+max-public-methods = 20
+max-nested-blocks = 5
+
+[BASIC]
+# Allow common single-letter names used in data/Spark code
+good-names = i,j,k,n,x,y,z,f,e,v,df,sc,rdd,col,row,db,dt,ts
+good-names-rgxs = ^[a-z]$
+
+argument-naming-style = snake_case
+attr-naming-style = snake_case
+class-naming-style = PascalCase
+const-naming-style = UPPER_CASE
+function-naming-style = snake_case
+method-naming-style = snake_case
+module-naming-style = snake_case
+variable-naming-style = snake_case
+
+inlinevar-naming-style = any
+
+# Databricks cluster globals injected by the notebook environment at runtime
+additional-builtins = dbutils,spark,sc,sqlContext,display,displayHTML,getArgument,table
+
+[IMPORTS]
+allow-wildcard-with-all = no
+known-third-party = pyspark,databricks,pandas,numpy
+
+[EXCEPTIONS]
+overgeneral-exceptions = builtins.BaseException,builtins.Exception
+
+[TYPECHECK]
+ignored-modules = pyspark,databricks
+ignored-classes = SparkContext,SparkSession,DataFrame,Column,Row,DynamicFrame

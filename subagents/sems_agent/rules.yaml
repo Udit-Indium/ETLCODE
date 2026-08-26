@@ -1,0 +1,564 @@
+# SEMS Rule Catalog — Shell Engineering Management System
+#
+# Every SEMS check is defined here. The compliance checker loads these rules at
+# import time so new requirements from Shell can be added without touching Python code.
+#
+# severity : hard  → blocks STAM promotion; counted as a violation
+#            soft  → flagged for review; counted as a warning
+# category : syntax | security | spark_best_practices | error_handling
+#            | documentation | databricks_compatibility
+# pattern_type : regex | ast | ast_allowlist | ast_parent | custom
+#
+# Category weights (must sum to 1.0):
+#   syntax                   0.20
+#   security                 0.25
+#   spark_best_practices     0.20
+#   error_handling           0.15
+#   documentation            0.10
+#   databricks_compatibility 0.10
+#
+# Readiness tiers:
+#   90–100 : Ready
+#   80–89  : Minor remediation
+#   60–79  : Needs improvement
+#   < 60   : Reject
+
+rules:
+
+  # ── Security (hard violations) ─────────────────────────────────────────────
+  - id: SEC001
+    severity: hard
+    category: security
+    description: "Hardcoded credential (password, token, secret, API key)"
+    pattern_type: regex
+    remediation: >
+      Move secrets to a Databricks secret scope and retrieve with
+      dbutils.secrets.get(scope='<scope>', key='<key>').
+      Never store credentials in source files.
+
+  - id: SEC002
+    severity: hard
+    category: security
+    description: "subprocess import — shell execution not permitted in STAM workloads"
+    pattern_type: regex
+    remediation: >
+      Remove subprocess usage. Use dbutils for file operations or
+      Spark for data processing. If OS interaction is required,
+      raise a STAM exception request with the Shell security team.
+
+  - id: SEC003
+    severity: hard
+    category: security
+    description: "eval()/exec() — dynamic code execution is a security risk"
+    pattern_type: regex
+    remediation: >
+      Refactor to use explicit, static logic. Dynamic evaluation
+      prevents static analysis and is not permitted in production workloads.
+
+  # ── Syntax / API correctness ───────────────────────────────────────────────
+  - id: SPARK003
+    severity: hard
+    category: syntax
+    description: "Possible PySpark API typo — function name not in the allowed list"
+    pattern_type: ast_allowlist
+    remediation: >
+      Correct the function name. The violation message includes the closest
+      match from the pyspark.sql.functions allowlist. Confidence > 95% when
+      edit distance == 1.
+
+  # ── Spark best practices ───────────────────────────────────────────────────
+  - id: SPARK001
+    severity: soft
+    category: spark_best_practices
+    description: "Unbounded collect() — no .limit(N) guard before driver collection"
+    pattern_type: ast
+    remediation: >
+      Add a .limit(N) guard before .collect(), or replace with .take(N) / .first().
+      Example — bad : rows = df.collect()
+               good : rows = df.limit(1_000).collect()
+               alt  : row  = df.first()
+
+  - id: SPARK002
+    severity: soft
+    category: spark_best_practices
+    description: "Full .count() compared against 0 — triggers a full cluster scan just to check emptiness"
+    pattern_type: ast
+    remediation: >
+      Replace 'df.count() == 0' / 'df.count() > 0' with df.isEmpty()
+      (Spark 3.3+) or df.limit(1).count(), which short-circuit after the
+      first row instead of scanning the whole DataFrame.
+
+  - id: SPARK004
+    severity: soft
+    category: spark_best_practices
+    description: "toPandas() — collects the entire DataFrame onto the driver"
+    pattern_type: ast
+    remediation: >
+      Filter to a small result set before calling toPandas(), or use Spark's
+      native write APIs instead of converting to pandas.
+
+  - id: SPARK005
+    severity: soft
+    category: spark_best_practices
+    description: "toLocalIterator() — streams every row to the driver, one partition at a time"
+    pattern_type: ast
+    remediation: >
+      Only call toLocalIterator() on a small, already-filtered DataFrame;
+      prefer Spark transformations for anything that scales with input size.
+
+  - id: SPARK006
+    severity: soft
+    category: spark_best_practices
+    description: "Driver-side loop iterating over Spark data"
+    pattern_type: regex
+    remediation: >
+      Replace 'for row in df.collect()' with Spark transformations:
+      df.withColumn(), df.groupBy(), df.filter(). Driver-side loops
+      eliminate all parallelism.
+
+  - id: SPARK007
+    severity: soft
+    category: spark_best_practices
+    description: "pandas_udf detected — prefer native PySpark functions"
+    pattern_type: regex
+    remediation: >
+      Replace pandas_udf with native pyspark.sql.functions equivalents where
+      possible. pandas_udf adds serialisation overhead and limits query
+      optimiser push-down.
+
+  - id: SPARK008
+    severity: soft
+    category: spark_best_practices
+    description: "Multiple SparkSession.builder calls — re-creating the session is inefficient"
+    pattern_type: regex
+    remediation: >
+      Use the shared 'spark' variable provided by the Databricks cluster.
+      Call SparkSession.builder at most once, at module initialisation.
+
+  # ── Error handling ─────────────────────────────────────────────────────────
+  - id: SEMS_ERR001
+    severity: soft
+    category: error_handling
+    description: "Spark action (.count() / .collect()) not wrapped in try/except"
+    pattern_type: ast_parent
+    remediation: |
+      Wrap every Spark action in try/except to handle AnalysisException,
+      SparkException, and transient network failures:
+
+        try:
+            result = df.count()
+        except Exception as exc:
+            logger.error("Spark action failed: %s", exc)
+            raise
+
+  - id: LOG001
+    severity: soft
+    category: error_handling
+    description: "logging module not imported or logger not used"
+    pattern_type: regex
+    remediation: >
+      Add 'import logging' at the top of the file and replace all print()
+      calls with logger.info() / logger.warning() / logger.error().
+
+  - id: LOG002
+    severity: soft
+    category: error_handling
+    description: "Bare print() statements — use logger instead"
+    pattern_type: regex
+    remediation: >
+      Replace print() with logger.info() or logger.debug() so log level
+      filtering and structured log shipping work correctly.
+
+  - id: LOG003
+    severity: soft
+    category: error_handling
+    description: "Possible PII or secret in log message (password, token, secret, email, ssn)"
+    pattern_type: regex
+    remediation: >
+      Never log credentials or personal data. Redact the value before logging,
+      or move the call to logger.debug() and gate debug output behind a
+      production log-level filter. For PII, use a hashing or masking helper.
+
+  - id: ERR001
+    severity: soft
+    category: error_handling
+    description: "No try/except block present in the module"
+    pattern_type: ast
+    remediation: >
+      Wrap external calls (Spark actions, file I/O, JDBC) in try/except so
+      failures are logged and re-raised instead of aborting the job with an
+      unhandled exception.
+
+  - id: ERR002
+    severity: soft
+    category: error_handling
+    description: "Bare except: or except Exception: without re-raise"
+    pattern_type: ast
+    remediation: |
+      Catch specific exception types (AnalysisException, IOError, …). When a
+      broad catch is unavoidable, always log and re-raise so the cluster job
+      records the failure:
+
+        try:
+            result = df.collect()
+        except AnalysisException as exc:
+            logger.error("Spark plan failed: %s", exc)
+            raise
+
+  # ── Documentation ─────────────────────────────────────────────────────────
+  - id: DOC001
+    severity: soft
+    category: documentation
+    description: "Module docstring missing Input: / Output: sections"
+    pattern_type: ast
+    remediation: |
+      Add I/O sections to the module-level docstring so lineage can be
+      audited by the STAM layer:
+
+        \"\"\"
+        Pipeline: <descriptive name>
+
+        Inputs:
+          - Delta table: <schema.table_name>
+
+        Outputs:
+          - Delta table: <schema.table_name>
+
+        Execution: Databricks STAM
+        \"\"\"
+
+  - id: DOC002
+    severity: soft
+    category: documentation
+    description: "Function/method has a docstring but does not document every parameter under an Args: section"
+    pattern_type: ast
+    remediation: >
+      Add each parameter to an Args: section, e.g.
+      'Args:\n    df: input DataFrame.\n    threshold: cutoff value.'.
+      Only evaluated when a docstring already exists — a missing docstring
+      entirely is caught by pydocstyle (D101/D102/D103) instead.
+
+  - id: DOC003
+    severity: soft
+    category: documentation
+    description: "Function/method returns or yields a value but its docstring has no Returns:/Yields: section"
+    pattern_type: ast
+    remediation: >
+      Add a Returns: (or Yields: for a generator) section describing the
+      returned value, e.g. 'Returns:\n    Filtered DataFrame.'.
+      @property/@cached_property getters are exempt — the summary line
+      typically describes the value directly.
+
+  # ── Databricks compatibility ───────────────────────────────────────────────
+  - id: SPARK009
+    severity: soft
+    category: databricks_compatibility
+    description: "Local filesystem path — use DBFS or cloud storage URIs"
+    pattern_type: regex
+    remediation: >
+      Replace local paths (/home/, /tmp/, /var/, C:\) with DBFS paths
+      (/dbfs/mnt/...) or cloud URIs (s3://, abfss://). Local paths are
+      only accessible on the driver node and do not survive cluster restarts.
+
+  - id: SPARK010
+    severity: soft
+    category: databricks_compatibility
+    description: "dbutils.fs call inside a loop — use Spark glob patterns instead"
+    pattern_type: custom
+    remediation: >
+      Replace dbutils.fs inside loops with spark.read for directory-level
+      reads, or collect all paths first and process with Spark parallelism.
+
+  # ── Construction Policy alignment (literals, comments, metrics) ───────────
+  - id: LIT001
+    severity: soft
+    category: syntax
+    description: "Repeated magic literal used in a condition — extract as a named constant"
+    pattern_type: ast
+    remediation: >
+      Declare the literal as a module-level UPPER_CASE constant and reference
+      the name instead, e.g. replace 'if retries > 3:' with
+      'MAX_RETRIES = 3' followed by 'if retries > MAX_RETRIES:'.
+
+  - id: LIT002
+    severity: soft
+    category: syntax
+    description: "Repeated magic string literal used in a condition — extract as a named constant"
+    pattern_type: ast
+    remediation: >
+      Declare the string as a module-level UPPER_CASE constant and reference
+      the name instead, e.g. replace 'if status == "ACTIVE":' (repeated 3+
+      times) with 'STATUS_ACTIVE = "ACTIVE"' followed by
+      'if status == STATUS_ACTIVE:'.
+
+  - id: PARAM001
+    severity: soft
+    category: syntax
+    description: "Parameter reassigned to a value unrelated to its input — the caller's argument is discarded"
+    pattern_type: ast
+    remediation: >
+      Assign the new value to a separate local variable instead of
+      overwriting the parameter, e.g. replace 'def f(threshold): threshold = 100'
+      with 'def f(threshold): effective_threshold = 100'. A self-derived
+      chain such as 'df = df.filter(...)' is idiomatic and is not flagged.
+
+  - id: ATTR001
+    severity: soft
+    category: syntax
+    description: "Instance attribute assigned via self.x but never read within the class body"
+    pattern_type: ast
+    remediation: >
+      Remove the attribute if it is genuinely unused, or reference it where
+      it is needed. Best-effort within a single class body — an attribute
+      read only from a subclass or external caller will not be visible to
+      this check, so treat a finding as a lead to verify.
+
+  - id: STYLE001
+    severity: soft
+    category: syntax
+    description: "Function body exceeds the 60-line length limit"
+    pattern_type: ast
+    remediation: >
+      Extract cohesive blocks of the function into helper functions so each
+      piece can be read, tested, and named independently.
+
+  - id: COM001
+    severity: soft
+    category: documentation
+    description: "TODO/FIXME/XXX comment present — must be resolved before release"
+    pattern_type: custom
+    remediation: >
+      Resolve the outstanding work or remove the comment before release.
+      Track follow-up work in Git history / the issue tracker instead of
+      leaving TODO markers in shipped code.
+
+  - id: COM002
+    severity: soft
+    category: documentation
+    description: "Commented-out code detected"
+    pattern_type: custom
+    remediation: >
+      Delete the commented-out code. Git history already preserves it if it
+      needs to be recovered later.
+
+  - id: FUNC001
+    severity: soft
+    category: syntax
+    description: "Boolean-returning function does not use an is_/has_/can_-style name"
+    pattern_type: ast
+    remediation: >
+      Rename the function to a predicate-style name (is_valid, has_permission,
+      can_execute, should_retry, ...) so the boolean return value is obvious
+      from the call site.
+
+  - id: FANOUT001
+    severity: soft
+    category: syntax
+    description: "Function fan-out (distinct callees) exceeds the quality-metric threshold"
+    pattern_type: ast
+    remediation: >
+      Reduce the number of distinct functions/methods this function calls
+      directly (threshold: 7 acceptable, 8-10 needs justification, 11+
+      unacceptable). Extract cohesive groups of calls into helper functions
+      or a facade to reduce coupling.
+
+  - id: EXPR001
+    severity: soft
+    category: syntax
+    description: "Expression has too many terms (boolean/comparison chain)"
+    pattern_type: ast
+    remediation: >
+      Break the expression into named sub-expressions or helper predicates
+      (threshold: 5 acceptable, 6-8 needs justification, 9+ unacceptable) so
+      the intent of each term is clear.
+
+  - id: NEST001
+    severity: soft
+    category: syntax
+    description: "Decision nesting depth exceeds the quality-metric threshold"
+    pattern_type: ast
+    remediation: >
+      Flatten nested if/for/while/try/with blocks using guard clauses, early
+      returns, or by extracting inner blocks into helper functions (threshold:
+      4 acceptable, 5-6 needs justification, 7+ unacceptable).
+
+  - id: CONST001
+    severity: soft
+    category: syntax
+    description: "Module-level UPPER_CASE constant is reassigned — public constants should be read-only"
+    pattern_type: ast
+    remediation: >
+      Assign the constant exactly once at module level. If the value is
+      meant to change, rename it out of UPPER_CASE so it isn't read as a
+      public constant.
+
+  - id: FILE001
+    severity: soft
+    category: syntax
+    description: "File defines more than one top-level class — one abstract concept per file is expected"
+    pattern_type: ast
+    remediation: >
+      Split the module so each file defines a single class / abstract concept
+      (Construction Policy 2a). Move the additional class(es) into their own
+      modules and import them where needed.
+
+  - id: STMT001
+    severity: soft
+    category: documentation
+    description: "Intentionally empty statement (pass / ...) is not documented with a comment"
+    pattern_type: ast
+    remediation: >
+      Add a short comment on or directly above the empty statement explaining
+      why it is intentionally empty (Construction Policy 11b), e.g.
+      'pass  # no cleanup required'.
+
+  - id: DUP001
+    severity: soft
+    category: syntax
+    description: "Duplicate block of 4+ statements repeated across two functions — extract a shared helper"
+    pattern_type: ast
+    remediation: >
+      Extract the repeated statements into a shared helper function (e.g.
+      def clean_columns(df): ...) and call it from both sites instead of
+      copy-pasting the transformation. Detected within a single file — pylint's
+      duplicate-code (R0801) only compares across multiple files, so this rule
+      exists to cover the intra-file case.
+
+################
+# Company-Specific Compliance Rules — Shell STAM Layer
+#
+# These rules EXTEND the base SEMS rules in rules.yaml.
+# They are loaded by agent_fixer.py and injected into the LLM context.
+#
+# auto_fixable: false  → agent proposes a patch, human must approve
+# auto_fixable: true   → could be handled deterministically (add to auto_fix.py instead)
+#
+# Fields:
+#   id           : unique rule ID (use company prefix, e.g. SHELL_XXX)
+#   severity     : hard (blocks promotion) | soft (warning)
+#   description  : one-line summary shown in gap reports
+#   rationale    : why Shell requires this (links to internal policy if possible)
+#   pattern_hint : plain-English description of what code pattern triggers this rule
+#   fix_hint     : plain-English description of the required fix
+#   auto_fixable : whether a deterministic fixer could handle this (default false)
+
+company_rules:
+
+  # ── PII / Data Privacy ────────────────────────────────────────────────────
+  - id: SHELL_PII001
+    severity: hard
+    description: "PII column written to Delta without masking"
+    rationale: >
+      Shell's data privacy policy requires that columns containing personal data
+      (email, phone, national_id, ssn, date_of_birth) are SHA-256 hashed or
+      redacted before writing to any Delta table accessible outside the raw zone.
+    pattern_hint: >
+      Look for df.write or df.writeTo calls where the DataFrame still contains
+      columns named email, phone_number, national_id, ssn, or date_of_birth
+      without a prior F.sha2() / F.hash() / F.lit('REDACTED') transformation.
+    fix_hint: >
+      Add a .withColumn("email", F.sha2(F.col("email"), 256)) (or equivalent)
+      for each PII column before the write statement. Import sha2 from
+      pyspark.sql.functions if not already present.
+    auto_fixable: false
+
+  - id: SHELL_PII002
+    severity: hard
+    description: "PII field logged or printed in plain text"
+    rationale: >
+      Logging raw PII violates Shell's data handling policy and GDPR Article 5.
+      Log messages must never contain personal data in readable form.
+    pattern_hint: >
+      logger.* or print() calls whose format string or arguments reference
+      columns / variables named email, phone, national_id, ssn, date_of_birth,
+      or full_name.
+    fix_hint: >
+      Replace the PII value with a truncated hash or a placeholder such as
+      logger.info("Processing record id=%s", record_id) — remove the PII field
+      from the log call entirely.
+    auto_fixable: false
+
+  # ── Naming Conventions ────────────────────────────────────────────────────
+  - id: SHELL_NAME001
+    severity: soft
+    description: "Delta table name does not follow <domain>_<entity>_<layer> convention"
+    rationale: >
+      Shell's data catalogue requires table names in the format
+      <domain>_<entity>_<layer>, e.g. trading_position_raw, hr_employee_curated.
+      Non-conforming names break automated lineage tagging in the STAM catalogue.
+    pattern_hint: >
+      String literals passed to spark.read.table(), spark.table(),
+      df.writeTo(), df.write.saveAsTable(), df.write.insertInto(), or
+      DeltaTable.forName() that do not match the pattern
+      [a-z]+_[a-z_]+_(raw|staging|curated|published).
+    fix_hint: >
+      Rename the table reference to follow <domain>_<entity>_<layer>. If the
+      domain or layer is unknown, leave a TODO comment and flag for the data
+      steward rather than guessing.
+    auto_fixable: false
+
+  # ── Shell-Specific Spark Patterns ─────────────────────────────────────────
+  - id: SHELL_SPARK001
+    severity: soft
+    description: "Hard-coded partition count — use dynamic coalesce based on data size"
+    rationale: >
+      Hard-coded .repartition(N) values become bottlenecks when data volume
+      changes. Shell STAM pipelines should use adaptive query execution (AQE)
+      or derive partition count from configuration.
+    pattern_hint: >
+      .repartition(N) calls where N is a literal integer constant, not a
+      variable or config value.
+    fix_hint: >
+      Replace .repartition(200) with .repartition(spark.conf.get(
+      "spark.sql.shuffle.partitions", "200")) or remove the call entirely
+      and let AQE manage it (spark.conf.set("spark.sql.adaptive.enabled", "true")).
+    auto_fixable: false
+
+  - id: SHELL_SPARK002
+    severity: hard
+    description: "Direct JDBC write without partitionColumn — causes single-partition bottleneck"
+    rationale: >
+      Writing to JDBC without partitionColumn serialises all data through a
+      single Spark task, which is both slow and can exhaust the JDBC connection
+      pool on Shell's Oracle/SQL Server databases.
+    pattern_hint: >
+      df.write.format("jdbc") or df.write.jdbc() calls that do not include
+      partitionColumn, lowerBound, and upperBound options.
+    fix_hint: >
+      Add .option("partitionColumn", "<numeric_key_column>")
+             .option("lowerBound", 0)
+             .option("upperBound", <estimated_max>)
+             .option("numPartitions", 10)
+      to the JDBC write call. Choose a numeric column with good cardinality.
+    auto_fixable: false
+
+  # ── Databricks / STAM Specific ────────────────────────────────────────────
+  - id: SHELL_STAM001
+    severity: hard
+    description: "SparkSession created with .master('local') — not permitted in STAM"
+    rationale: >
+      .master('local') runs Spark in single-process mode and bypasses the STAM
+      cluster. All production workloads must use the cluster-provided SparkSession.
+    pattern_hint: >
+      SparkSession.builder.master("local") or .master("local[*]") anywhere in
+      the source.
+    fix_hint: >
+      Remove the .master(...) call entirely. The Databricks cluster injects a
+      pre-configured SparkSession via the `spark` variable. Use that directly.
+    auto_fixable: false
+
+  - id: SHELL_STAM002
+    severity: soft
+    description: "Widget value read without a default — fails on non-interactive runs"
+    rationale: >
+      dbutils.widgets.get() raises an error when the widget is absent (e.g. in
+      automated job runs). STAM pipelines must always supply a default so the
+      job can run headlessly.
+    pattern_hint: >
+      dbutils.widgets.get("<name>") calls that are not accompanied by a prior
+      dbutils.widgets.text("<name>", "<default>") call for the same widget name.
+    fix_hint: >
+      Add dbutils.widgets.text("<name>", "<default_value>") before the
+      dbutils.widgets.get("<name>") call. Choose a safe, non-empty default that
+      allows the pipeline to run in CI without manual input.
+    auto_fixable: false
