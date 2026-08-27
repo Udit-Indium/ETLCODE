@@ -869,18 +869,33 @@ def read_functions_tool(context: ToolContext, function_names: list[str]) -> dict
 
 def read_source_functions_tool(context: ToolContext, function_names: list[str]) -> dict:
     """Return the ORIGINAL Python source of the named functions (ground truth).
-
+ 
     Use this before fixing/converting a function so you match the source's real
     behaviour instead of guessing. Read from outputs/source_script.py — pull only
     the handful you are working on this turn, never the whole file.
     Unknown names are listed under `not_found`."""
     src = _source_text()
     if not src.strip():
-        return {"available": False, "functions": {}, "not_found": list(function_names or [])}
+        return {
+            "available": False, "functions": {},
+            "not_found": list(function_names or []),
+            "note": (
+                f"The original source is not readable at {SOURCE_SCRIPT}, so there "
+                f"is NO ground truth available for any function this run. Say so "
+                f"rather than guessing at behaviour."
+            ),
+        }
     try:
         tree = ast.parse(src)
     except SyntaxError:
-        return {"available": False, "functions": {}, "not_found": list(function_names or [])}
+        return {
+            "available": False, "functions": {},
+            "not_found": list(function_names or []),
+            "note": (
+                f"The original source at {SOURCE_SCRIPT} does not parse, so no "
+                f"ground truth is available. Say so rather than guessing."
+            ),
+        }
     by_name = {
         n.name: (ast.get_source_segment(src, n) or "")
         for n in tree.body
@@ -889,7 +904,17 @@ def read_source_functions_tool(context: ToolContext, function_names: list[str]) 
     requested = list(function_names or [])
     found = {name: by_name[name] for name in requested if name in by_name}
     not_found = [name for name in requested if name not in by_name]
-    return {"available": True, "functions": found, "not_found": not_found}
+    result = {"available": True, "functions": found, "not_found": not_found}
+    if not_found:
+        result["note"] = (
+            "These names have no counterpart in the original script. That is "
+            "normal for helpers the conversion introduced (session builders, "
+            "save/write helpers, port-only utilities) -- it does NOT mean they "
+            "are hallucinated and must NOT be deleted. Define their expected "
+            "behaviour from the conversion conventions and from their call "
+            "sites in the converted module instead."
+        )
+    return result
 
 
 def read_converted_file_tool(context: ToolContext) -> dict:

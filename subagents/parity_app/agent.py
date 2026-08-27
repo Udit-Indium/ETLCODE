@@ -7,12 +7,23 @@ import re
 import time
 import uuid
 import requests
-from google.adk.agents import Agent
+from google.adk.agents import Agent, BaseAgent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools.tool_context import ToolContext
 from dotenv import load_dotenv
 from .tools import run_parser
+# The converter's list of pip-installable-on-Databricks modules, reused rather
+# than copied. A copy is exactly what failed here: this driver grew its own
+# openpyxl list, a rewrite dropped it, and the same ModuleNotFoundError was then
+# fixed for the converter's execute tool alone — so the converter installed the
+# package and the parity run that imports the very same module did not. The app
+# keeps its own parser, but not its own opinion about what a cluster ships.
+from ..conversion_loop.code_converter.code_convertor_agent import (
+    SOURCE_SCRIPT,
+    _imported_modules,
+    _requirement_for,
+)
 
 # Rate limiting is NOT wired up per-agent. `subagents/litellm_patch.py` patches
 # litellm.completion/acompletion on import of the `subagents` package, so every
@@ -34,6 +45,12 @@ HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
     "Content-Type": "application/json",
 }
+
+#: Per-request ceiling for every Databricks call below. The 600s budget in
+#: _run_pytest_suite bounds the POLLING LOOP, not any single request — without
+#: this a hung connection blocks the callback, and with it the whole loop,
+#: indefinitely.
+_HTTP_TIMEOUT = 60
 
 
 def _pytest_path() -> pathlib.Path:
@@ -63,13 +80,58 @@ def _find_converted_module() -> "pathlib.Path | None":
     return found[0] if found else None
 
 
-def load_functions_to_test(callback_context: CallbackContext) -> None:
-    """Pre-agent-call callback.
+def _skip_agent_response(message: str):
+    """Content that makes ADK skip the agent's model call entirely.
+
+    Returning content from a before-agent callback is ADK's documented way to
+    bypass the model. Wrapped because the import path has moved between
+    versions and a skip optimisation must never be what breaks a run: on any
+    failure this returns None, the callback falls through, and the agent runs
+    exactly as it did before.
+    """
+    try:
+        from google.genai import types
+
+        return types.Content(role="model", parts=[types.Part(text=message)])
+    except Exception:
+        return None
+
+
+def _writer_work_signature(state) -> tuple:
+    """What the writer would be reacting to this iteration.
+
+    Two things can give it something to do: a function with no test yet, and a
+    failing test that is wrong and needs rewriting. Nothing else in its prompt
+    changes between iterations, so an unchanged signature means an unchanged
+    question — and the same answer.
+    """
+    status = state.get("parity_test_status") or {}
+    missing = tuple(status.get("missing_functions") or [])
+    result = state.get("pytest_last_result") or {}
+    failing = tuple(sorted(
+        f.get("test", "") for f in (result.get("failed_tests") or [])
+    ))
+    return (missing, failing)
+
+
+def load_functions_to_test(callback_context: CallbackContext):
+    """Pre-agent-call callback for the WRITER.
 
     Reads the converted PySpark script path from state, parses it, and stores
     the list of function names that the agent must generate test cases for
-    under state["functions_to_test"]. That is all this callback does — it does
-    NOT look at tests or coverage.
+    under state["functions_to_test"].
+
+    Also skips the writer's model call when it has nothing to react to. Once
+    coverage is complete the writer still got its whole prompt every iteration
+    — the function list, the module index, the last pytest output — only to
+    answer "the task is fully complete" and stop. That is a full turn per
+    iteration to say nothing.
+
+    Skipped ONLY when the work signature is unchanged. A failing test may be
+    the TEST's fault rather than the code's, and the writer is the only agent
+    allowed to rewrite one, so the first appearance of any failure set always
+    reaches it. What is suppressed is being asked the identical question again
+    after a fixer pass that changed nothing about it.
     """
     state = callback_context.state
     state.setdefault("pytest_last_stdout", "")
@@ -132,22 +194,58 @@ def load_functions_to_test(callback_context: CallbackContext) -> None:
         ),
     })
 
+    signature = _writer_work_signature(state)
+    missing = signature[0]
+    if not missing and state.get("parity_writer_last_seen") == list(map(list, signature)):
+        return _skip_agent_response(
+            "Coverage is complete and the failing tests are unchanged since I "
+            "last looked at them, so there is nothing for me to write or "
+            "rewrite. The converted code is repaired next."
+        )
+
+    # Stored as plain lists: session state is serialised to JSON, and a tuple
+    # comes back as a list, so comparing tuples would never match on a resumed
+    # session and the skip would silently stop working.
+    state["parity_writer_last_seen"] = list(map(list, signature))
     return None
 
 def _extract_test_functions(test_source: str) -> list[str]:
-    """Return the names of every `def test_*` defined in the test file."""
+    """Names of the tests in the file that pytest will actually collect.
+
+    This list is what decides coverage, so it has to match pytest's own rule
+    rather than approximate it. `ast.walk` also reached a `def test_x` NESTED
+    inside a helper or a fixture, which pytest never collects — counting one
+    marked its target function covered, let the loop call the run green, and
+    left that function with no test that had ever executed.
+
+    `test_` rather than `test`, because `_missing_functions` attributes a test
+    to a function by stripping exactly that prefix; matching a looser set here
+    only inflates the count the writer is asked to compare against.
+
+    Methods of a top-level `Test*` class are included: pytest collects those
+    too, and leaving them out would strand a class-shaped suite at incomplete
+    coverage forever.
+    """
     if not test_source.strip():
         return []
     try:
         tree = ast.parse(test_source)
     except SyntaxError:
         return []
-    return [
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name.startswith("test")
-    ]
+
+    names: list[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test_"):
+                names.append(node.name)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            names.extend(
+                child.name
+                for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and child.name.startswith("test_")
+            )
+    return names
 
 def _missing_functions(target_names: list[str], test_functions: list[str]) -> list[str]:
     """Target functions with no test of their own.
@@ -233,6 +331,7 @@ def _structured_pytest_result(stdout: str, stderr: str, returncode: "int | None"
     repairs anything, however many tests failed.
     """
     failed: list[dict] = []
+    collect_errors: list[str] = []
     for line in _strip_ansi(stdout).splitlines():
         # Tolerate both shapes: raw pytest ("FAILED x::y - err") and the
         # summarised form, which bullets each failure as "  - FAILED ...".
@@ -242,18 +341,36 @@ def _structured_pytest_result(stdout: str, stderr: str, returncode: "int | None"
                 continue
             body = stripped[len(marker):]
             token, _, detail = body.partition(" - ")
-            name = token.split(" ")[0].rsplit("::", 1)[-1].strip()
+            node = token.split(" ")[0].strip()
+            # A node id with no "::" names the FILE, not a test — which is how
+            # pytest reports a collection error, i.e. the suite never imported
+            # and nothing ran at all. Recording it as a failing test called
+            # "pyspark_pytest.py" broke the loop twice over: the fixer strips a
+            # `test_` prefix to get the function to repair and there is no such
+            # function, and a non-empty failed_tests also stops
+            # check_test_case_status taking its run_error exit — so every
+            # iteration re-ran the same unrunnable suite until max_iterations.
+            if "::" not in node:
+                collect_errors.append(_cap(f"{marker.strip()} {body}", 300))
+                break
+            name = node.rsplit("::", 1)[-1]
             if name and not any(f["test"] == name for f in failed):
                 failed.append({"test": name, "error": _cap(detail.strip(), 200)})
+            break
     result = {
         "passed": returncode == 0,
         "failed_tests": failed,
         "failed_count": len(failed),
     }
-    if returncode != 0 and not failed:
-        # Nothing parsed as a test failure: the run itself broke (import error,
-        # cluster problem). Pass the raw text through rather than reporting an
-        # empty failure list, which would read as "nothing wrong".
+    if collect_errors:
+        # Reported even when some tests also failed: a suite that could not be
+        # collected has no trustworthy per-test verdict, and the import is what
+        # has to be fixed first.
+        result["run_error"] = _cap(" ".join(collect_errors), 600)
+    elif returncode != 0 and not failed:
+        # Nothing parsed as a test failure: the run itself broke (cluster
+        # problem, driver crash). Pass the raw text through rather than
+        # reporting an empty failure list, which would read as "nothing wrong".
         result["run_error"] = _cap(_strip_ansi(stderr or stdout), 600)
     return result
 
@@ -278,6 +395,26 @@ def _record_run_failure(state, reason: str) -> None:
     }
 
 
+def _cancel_run(run_id) -> None:
+    """Stop a Databricks run we have stopped waiting for.
+
+    A timed-out run used to be abandoned: the callback reported the timeout and
+    returned, but the job kept running and billing, and the `finally` in
+    _run_pytest_suite then deleted the driver notebook out from under it.
+    Best-effort — the timeout is already recorded and a failure to cancel must
+    not replace that with a less useful error.
+    """
+    try:
+        requests.post(
+            f"{HOST}/api/2.2/jobs/runs/cancel",
+            headers=HEADERS,
+            json={"run_id": run_id},
+            timeout=_HTTP_TIMEOUT,
+        )
+    except Exception:
+        pass
+
+
 def _summarize_pytest(stdout: str, stderr: str, returncode: "int | None") -> str:
     """Condense raw pytest output down to only what the code-fixer needs.
 
@@ -297,25 +434,78 @@ def _summarize_pytest(stdout: str, stderr: str, returncode: "int | None") -> str
             counts = s
             break
     failures: list[str] = []
+    collect_errors: list[str] = []
     for l in lines:
         s = l.strip()
         if s.startswith("FAILED ") or s.startswith("ERROR "):
-            failures.append(_cap(s, _MAX_ERR_CHARS + 80))
+            node = s.split(" ", 1)[1].split(" ")[0] if " " in s else ""
+            # Same split as _structured_pytest_result: no "::" means the whole
+            # file failed to collect, which is not a failing test.
+            bucket = failures if "::" in node else collect_errors
+            bucket.append(_cap(s, _MAX_ERR_CHARS + 80))
 
-    if returncode == 0 and not failures:
+    if returncode == 0 and not failures and not collect_errors:
         return f"All tests passed. ({counts})" if counts else "All tests passed."
 
     parts: list[str] = []
     if counts:
         parts.append(counts)
+    if collect_errors:
+        parts.append(
+            f"{len(collect_errors)} collection error(s) — the suite did not "
+            f"import, so NO test ran:"
+        )
+        parts.extend(f"  - {e}" for e in collect_errors)
     if failures:
         parts.append(f"{len(failures)} failing test(s):")
         parts.extend(f"  - {f}" for f in failures)
-    else:
+    if not failures and not collect_errors:
         parts.append("No per-test summary parsed; tail of stderr:")
         parts.append(_cap(stderr or stdout, 1500))
 
     return "\n".join(parts)[:_MAX_SUMMARY_CHARS]
+
+
+#: Extra pip names to force, comma-separated, when the import scan is not
+#: enough — a package reached only through a dependency is invisible to it.
+EXTRA_PIP_PACKAGES = [
+    name.strip()
+    for name in os.environ.get("PARITY_PIP_PACKAGES", "").split(",")
+    if name.strip()
+]
+
+
+def _needed_packages(module_src: str, test_src: str) -> list[str]:
+    """Pip requirements the converted module or its tests import and may lack.
+
+    A Databricks serverless runtime ships neither openpyxl nor the SQL
+    connector, and our own conversion rules mandate both: hard rule 5 forbids
+    xlwings (it drives desktop Excel and can never run on a cluster) and directs
+    Excel I/O to pandas + openpyxl. So the rules create a dependency that
+    nothing was installing, and the suite died on import before a single test
+    ran.
+
+    Scans BOTH sources: a module may reach a package only at run time while a
+    test imports it directly, and either way the import fails.
+
+    Scanned rather than blanket-installed — a fixed list costs cluster time on
+    every run for packages the code may never touch. A module with no Excel I/O
+    and no connector import installs nothing.
+    """
+    found: set[str] = set()
+    for src in (module_src, test_src):
+        for module in _imported_modules(src):
+            requirement = _requirement_for(module)
+            if requirement:
+                found.add(requirement)
+
+    # pandas reaches openpyxl through an engine rather than an import, so the
+    # scan above cannot see it — there is no `import openpyxl` anywhere for it
+    # to find, only a `pd.read_excel(...)` that fails at run time without it.
+    if any(call in module_src for call in ("read_excel", "to_excel", "ExcelWriter")):
+        found.add("openpyxl")
+
+    return sorted(found | set(EXTRA_PIP_PACKAGES))
 
 
 #: RAW string on purpose. This is Python source for a notebook, nested inside
@@ -339,6 +529,27 @@ if _DIR not in sys.path:
     sys.path.insert(0, _DIR)
 os.chdir(_DIR)
 
+# Installed BEFORE the tests import the module under test. A pip failure is
+# reported into the pytest output rather than raised: the suite may still pass
+# if the package was only needed by a path the tests never reach, and a pip
+# problem should read as test output, not as an opaque driver crash.
+_PIP_LOG = ""
+if _PIP_PACKAGES:
+    import importlib
+    import subprocess
+    _p = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q"] + _PIP_PACKAGES,
+        capture_output=True, text=True,
+    )
+    if _p.returncode != 0:
+        _PIP_LOG = "pip install %s failed: %s" % (_PIP_PACKAGES, (_p.stderr or "")[-500:])
+    # dbutils.library.restartPython() is not an option here — it would kill this
+    # notebook before it can return the result. Invalidating the import caches
+    # is the part that matters: the interpreter has already cached the contents
+    # of site-packages, so a package installed underneath it is not necessarily
+    # importable without this.
+    importlib.invalidate_caches()
+
 try:
     import pytest
 except ImportError:
@@ -354,6 +565,8 @@ with contextlib.redirect_stdout(_buf), contextlib.redirect_stderr(_buf):
                        "--color=no", "-p", "no:cacheprovider"])
 
 _out = _buf.getvalue()[-40000:]
+if _PIP_LOG:
+    _out = _PIP_LOG + "\n" + _out
 dbutils.notebook.exit(json.dumps({"returncode": int(_rc), "stdout": _out}))
 '''
 
@@ -370,6 +583,7 @@ def _pytest_driver_source(module_name: str, module_src: str, test_src: str) -> s
         f"_MODULE_NAME = {module_name!r}\n"
         f"_MODULE_B64 = {module_b64!r}\n"
         f"_TEST_B64 = {test_b64!r}\n"
+        f"_PIP_PACKAGES = {_needed_packages(module_src, test_src)!r}\n"
     )
     return header + _PYTEST_DRIVER_BODY
 
@@ -446,6 +660,7 @@ def _run_pytest_suite(state) -> "int | None":
                 "overwrite": True,
                 "content": base64.b64encode(driver.encode()).decode(),
             },
+            timeout=_HTTP_TIMEOUT,
         )
         r.raise_for_status()
 
@@ -472,6 +687,7 @@ def _run_pytest_suite(state) -> "int | None":
                     }
                 ],
             },
+            timeout=_HTTP_TIMEOUT,
         )
         r.raise_for_status()
 
@@ -483,6 +699,7 @@ def _run_pytest_suite(state) -> "int | None":
                 f"{HOST}/api/2.2/jobs/runs/get",
                 headers=HEADERS,
                 params={"run_id": run_id},
+                timeout=_HTTP_TIMEOUT,
             )
             r.raise_for_status()
             info = r.json()
@@ -494,6 +711,7 @@ def _run_pytest_suite(state) -> "int | None":
                 break
 
             if time.time() - start > timeout:
+                _cancel_run(run_id)
                 _record_run_failure(
                     state,
                     f"pytest run timed out after {timeout} seconds (run_id {run_id}).",
@@ -506,6 +724,7 @@ def _run_pytest_suite(state) -> "int | None":
             f"{HOST}/api/2.2/jobs/runs/get-output",
             headers=HEADERS,
             params={"run_id": task_run_id},
+            timeout=_HTTP_TIMEOUT,
         )
         r.raise_for_status()
         output = r.json()
@@ -544,6 +763,7 @@ def _run_pytest_suite(state) -> "int | None":
                 f"{HOST}/api/2.0/workspace/delete",
                 headers=HEADERS,
                 json={"path": workspace_path, "recursive": False},
+                timeout=_HTTP_TIMEOUT,
             )
         except Exception:
             pass
@@ -551,6 +771,15 @@ def _run_pytest_suite(state) -> "int | None":
 
 def check_test_case_status(callback_context: CallbackContext) -> None:
     """Escalation criteria for the enclosing test-correction LoopAgent.
+
+    Carried by `build_parity_verdict_agent`, NOT by the writer. It used to be
+    the writer's after_agent_callback, which welded two jobs together: ADK ends
+    an agent's run the moment a before-agent callback returns content
+    (`ctx.end_invocation = True`, base_agent.py) and returns BEFORE the
+    after-agent callback, so the writer could not be skipped without also
+    skipping the suite run and the escalate that ends the loop. Splitting them
+    is what lets the writer be skipped when it has nothing to write while the
+    verdict still runs every iteration.
 
     Reads pyspark_pytest.py, extracts the test functions, compares them against
     the functions_to_test list, and combines that with the pytest result.
@@ -643,14 +872,26 @@ def check_test_case_status(callback_context: CallbackContext) -> None:
         callback_context.actions.escalate = True
         return None
 
+    message = (
+        "All functions have tests, but the suite is failing. The converted "
+        "PySpark code is fixed next against the pytest errors below — fix "
+        "the code, never weaken a test."
+    )
+    # The fixer's step 2 treats the ORIGINAL script as ground truth, and reads it
+    # from a fixed path rather than from anything this app set. A standalone run
+    # can easily be pointed at a converted module whose original is absent — and
+    # the fixer would then discover that mid-run, one function at a time, with
+    # nothing in the verdict to explain why its repairs were unconvincing.
+    if not SOURCE_SCRIPT.is_file():
+        message += (
+            f" NOTE: the original script is missing from {SOURCE_SCRIPT}, so the "
+            f"fixer has no ground truth to compare against and can only work "
+            f"from the conventions and the call sites."
+        )
     state["parity_test_status"] = {
         "status": "failed",
         "missing_functions": [],
-        "message": (
-            "All functions have tests, but the suite is failing. The converted "
-            "PySpark code is fixed next against the pytest errors below — fix "
-            "the code, never weaken a test."
-        ),
+        "message": message,
         "pytest_output": state.get("pytest_last_stdout") or "",
     }
     state["parity_validation_passed"] = False
@@ -1046,5 +1287,40 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
         mode="task",
         output_key="test_generation_output",
         before_agent_callback=load_functions_to_test,
+        # No after_agent_callback. The writer writes outputs/pyspark_pytest.py
+        # and nothing else — it does not run the suite, judge it, or touch the
+        # converted module. build_parity_verdict_agent owns the verdict.
+    )
+
+
+class _ParityVerdictAgent(BaseAgent):
+    """Runs the suite and records the verdict. No model, no tools, no cost.
+
+    Exists so the judgement is a step of its own rather than a callback hanging
+    off the writer. All the work happens in `check_test_case_status`, its
+    after_agent_callback: ADK still emits that callback's event — carrying both
+    the state delta and `escalate` — for an agent that produced no events of
+    its own, which is the whole trick.
+    """
+
+    async def _run_async_impl(self, ctx):
+        return
+        yield  # never reached; makes this an async generator, as ADK requires
+
+
+def build_parity_verdict_agent(name: str = "parity_verdict_agent") -> BaseAgent:
+    """Construct a FRESH verdict step.
+
+    A factory for the same reason the other two are: ADK stamps `parent_agent`
+    onto every entry of a `sub_agents` list, so a shared instance would be
+    re-parented by whichever loop was built last.
+    """
+    return _ParityVerdictAgent(
+        name=name,
+        description=(
+            "Runs the pytest parity suite on Databricks, records the verdict, "
+            "and stops the loop when every function has a test and the suite "
+            "passes."
+        ),
         after_agent_callback=check_test_case_status,
     )
