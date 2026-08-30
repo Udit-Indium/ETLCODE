@@ -340,6 +340,10 @@ def ast_parser(context: ToolContext, script_path: str)-> dict[str, str]:
             ast_parsed_content = json.load(file)
         source_copy = OUTPUT_DIR / "source_script.py"
         source_copy.write_text(python_content, encoding="utf-8")
+        # A short path string, not the script's content — this is the one thing
+        # downstream agents cannot derive for themselves, and the documentation
+        # agent reads the original script from it.
+        context.state["source_script_path"] = str(source_copy)
         AST_INVENTORY.write_text(
             json.dumps(ast_parsed_content, indent=2, default=str), encoding="utf-8"
         )

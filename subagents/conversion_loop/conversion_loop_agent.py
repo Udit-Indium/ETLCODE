@@ -1,10 +1,11 @@
-from google.adk.agents import LoopAgent
+from google.adk.agents import LoopAgent, SequentialAgent
 
 from .code_converter import code_convertor_agent
 from .case_fact_validation_agent import case_fact_checker_agent
+from .documentation_generator_agent import documentation_generator_agent
 
-conversion_loop_agent = LoopAgent(
-    name="conversion_loop_agent",
+code_convertor_loop_agent = LoopAgent(
+    name="code_convertor_loop_agent",
     description=(
         "Converts the Python script to PySpark and fact-checks the result, "
         "looping until the case facts match or max_iterations is reached."
@@ -26,3 +27,8 @@ conversion_loop_agent = LoopAgent(
     max_iterations=16,
 )
 
+conversion_loop_agent = SequentialAgent(
+    name="conversion_loop_agent",
+    description="A sequential agent that orchestrates the code conversion and fact-checking process.",
+    sub_agents=[code_convertor_loop_agent, documentation_generator_agent]
+)

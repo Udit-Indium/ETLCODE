@@ -1,5 +1,4 @@
 import os
-
 from google.adk.agents import SequentialAgent
 from google.adk.apps import App
 from google.adk.apps.app import EventsCompactionConfig
@@ -9,13 +8,7 @@ from .subagents.conversion_loop import (
     conversion_loop_agent,
     semantic_validation_loop_agent,
 )
-# parity_app is deliberately NOT imported here. It is a standalone app with its
-# own root_agent and App — see subagents/parity_app/__init__.py. Adding it back
-# as a stage costs more than the stage itself: every sub_agent shares one
-# session, so whatever runs last inherits all the events before it, and parity
-# running fourth carried a 176,000-202,000 token prompt against a 200,000 ITPM
-# quota purely from history it never used.
-
+from .subagents.llm_call_logger import plugins as llm_log_plugins
 
 root_agent = SequentialAgent(
     name="orchestrator_agent",
@@ -35,16 +28,6 @@ root_agent = SequentialAgent(
     ],
 )
 
-#: How often session history is summarised. Tunable without a code edit,
-#: because it is the one lever that shrinks the prompt without changing what an
-#: agent can see inside a turn — it trades summarisation calls for prompt size,
-#: so a wrong value costs money or latency, never correctness.
-#:
-#: Lowered from 5 to 3 after a run hit the Databricks ITPM ceiling: a single
-#: request carried a 202,272-token prompt against a 200,000 ITPM quota, so no
-#: pacing could make it fit. Stages share one session, so the prompt grows
-#: across the whole pipeline rather than within one agent — which is why the
-#: parity suite was moved out of it entirely.
 COMPACTION_INTERVAL = int(os.environ.get("ADK_COMPACTION_INTERVAL", "3"))
 COMPACTION_OVERLAP = int(os.environ.get("ADK_COMPACTION_OVERLAP", "2"))
 
@@ -57,4 +40,5 @@ app = App(
     name="code_converter",
     root_agent=root_agent,
     events_compaction_config=events_compaction_config,
+    plugins=[*llm_log_plugins()],
 )

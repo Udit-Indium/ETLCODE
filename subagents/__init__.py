@@ -82,11 +82,27 @@ def env_status() -> dict[str, object]:
         "DATABRICKS_ITPM_DATABRICKS_CLAUDE_SONNET_4_5",
         "DATABRICKS_OTPM_DATABRICKS_CLAUDE_SONNET_4_5",
     )
+    # Everything that changes what the pipeline costs or records, reported with
+    # its value because none of these is a secret. `LLM_LOG*` are the call/state
+    # audit log's knobs; there is no .env.example here, so this is where they are
+    # documented. See subagents/llm_call_logger.py for what each one does.
+    knobs = (
+        "LLM_LOG",
+        "LLM_LOG_FILE",
+        "LLM_LOG_MAX_BLOCK_CHARS",
+        "LLM_LOG_REPEAT_BODIES",
+        "ADK_COMPACTION_INTERVAL",
+        "ADK_COMPACTION_OVERLAP",
+        "RATE_LIMIT_DEFAULT_MAX_TOKENS",
+        "RATE_LIMIT_BURST_FRACTION",
+        "RATE_LIMIT_FALLBACKS",
+    )
     return {
         **ENV_REPORT,
         # Presence only — never echo a credential.
         "required_set": {k: bool(os.environ.get(k)) for k in required},
         "quotas_set": {k: os.environ.get(k) for k in quotas},
+        "knobs_set": {k: os.environ.get(k) for k in knobs},
     }
 
 from . import litellm_patch  # noqa: E402,F401  (imported for its side effect)
