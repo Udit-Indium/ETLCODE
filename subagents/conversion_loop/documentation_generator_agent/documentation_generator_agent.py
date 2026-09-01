@@ -7,6 +7,7 @@ converted file.
 
 from __future__ import annotations
 
+import json
 import pathlib
 
 from google.adk.agents import Agent
@@ -29,6 +30,13 @@ VALIDATION_HEADING = "## Semantic validation"
 #: `_semantic_compare` records up to 50 differences. The document wants the shape
 #: of the mismatch, not the full log — the two JSON outputs on disk hold that.
 MAX_LISTED_DIFFERENCES = 10
+
+#: Dummy-data filenames to name individually before collapsing to a count.
+MAX_LISTED_ARTEFACTS = 6
+
+#: Cap on each agent's own account of its work. These are free text from a model
+#: and occasionally run long; the document wants what happened, not a transcript.
+MAX_NARRATIVE_CHARS = 1500
 
 #: How the check works, in the reader's terms. Static prose: the method is a
 #: property of the validation agent, not of any one run.
@@ -94,31 +102,112 @@ def write_documentation_tool(context: ToolContext, markdown: str) -> dict:
     return {"status": "success", "saved_file_path": str(path)}
 
 
+def _clip(text, limit: int) -> str:
+    """Collapse whitespace and trim to `limit` chars on a word boundary."""
+    text = " ".join(str(text or "").split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0].rstrip(" ,;:.") + " …(truncated)"
+
+
+def _describe_records(path_str) -> str:
+    """One line on an output JSON: its shape, or why there is no shape to give."""
+    if not path_str:
+        return "path not recorded"
+    path = pathlib.Path(str(path_str))
+    if not path.is_file():
+        return "not produced"
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "unreadable"
+    if not isinstance(rows, list):
+        return "unexpected shape (not a list of rows)"
+    columns = sorted({k for r in rows if isinstance(r, dict) for k in r})
+    return f"{len(rows)} rows x {len(columns)} columns"
+
+
+def _describe_dummy_dir(path_str) -> str:
+    """One line on the dummy dataset: what the validator actually generated."""
+    if not path_str:
+        return "path not recorded"
+    path = pathlib.Path(str(path_str))
+    if not path.is_dir():
+        return "not created"
+    names = sorted(f.name for f in path.iterdir() if f.is_file())
+    if not names:
+        return "empty — self-contained pipeline, no dummy data needed"
+    shown = ", ".join(names[:MAX_LISTED_ARTEFACTS])
+    rest = len(names) - MAX_LISTED_ARTEFACTS
+    return f"{len(names)} file(s): {shown}" + (f", +{rest} more" if rest > 0 else "")
+
+
+def _validation_has_run(state) -> bool:
+    """True once the validator has recorded a REAL verdict.
+
+    `semantic_match` is not evidence on its own. Two before-agent callbacks seed
+    it with a "has not run yet" placeholder so their instruction templates can
+    interpolate it — `load_semantic_inputs` in the validator and the shared
+    fixer callback in the converter. Checking only for the key's presence
+    therefore reports a verdict for a run that never compared anything.
+    """
+    if state.get("semantic_validation_passed") is not None:
+        return True
+    verdict = state.get("semantic_match") or {}
+    message = str(verdict.get("message") or "")
+    return bool(verdict) and not message.startswith("Semantic validation has not run")
+
+
 def _validation_section(state) -> str:
     """Render the `## Semantic validation` section from state.
 
-    Deterministic on purpose. Every fact here — the verdict, the differences, the
-    artefact paths — was put in state by the validation agent's
-    `check_semantic_match`. Handing the model the raw verdict and asking for prose
-    would add one more place for a "passed" to appear over a run that did not.
+    Deterministic on purpose. Every fact here was recorded by the validation
+    stage itself; handing the model the raw verdict and asking for prose would
+    add one more place for a "passed" to appear over a run that did not.
     """
+    lines = [VALIDATION_HEADING, "", HOW_VALIDATION_WORKS, ""]
+
+    if not _validation_has_run(state):
+        lines.append(
+            "**Verdict: NOT RUN** — semantic validation recorded no result for "
+            "this run, so the converted module has never been checked against "
+            "the original's output. The coverage and gaps above are the only "
+            "evidence in this document."
+        )
+        if state.get("semantic_setup_error"):
+            lines += ["", f"**Setup problem:** {state['semantic_setup_error']}"]
+        return "\n".join(lines)
+
+    validator = _clip(state.get("semantic_validation_output"), MAX_NARRATIVE_CHARS)
+    if validator:
+        lines += ["**What the validator did.** " + validator, ""]
+
+    fixer = _clip(state.get("semantic_code_fixer_output"), MAX_NARRATIVE_CHARS)
+    if fixer:
+        lines += ["**What the code fixer did.** " + fixer, ""]
+
+    dummy = state.get("semantic_dummy_dir")
+    runner = state.get("semantic_pyspark_runner_path")
+    artefacts = [
+        ("dummy dataset", dummy, _describe_dummy_dir(dummy)),
+        ("Python baseline output", state.get("semantic_python_output_path"),
+         _describe_records(state.get("semantic_python_output_path"))),
+        ("PySpark output", state.get("semantic_pyspark_output_path"),
+         _describe_records(state.get("semantic_pyspark_output_path"))),
+        ("PySpark runner", runner,
+         "written" if runner and pathlib.Path(str(runner)).is_file() else "not written"),
+    ]
+    artefacts = [row for row in artefacts if row[1]]
+    if artefacts:
+        lines += ["**Artefacts produced**", "",
+                  "| artefact | path | detail |", "| --- | --- | --- |"]
+        lines += [f"| {label} | `{path}` | {detail} |" for label, path, detail in artefacts]
+        lines.append("")
+
     verdict = state.get("semantic_match") or {}
     matched = bool(verdict.get("match"))
     differences = list(verdict.get("differences") or ())
     message = str(verdict.get("message") or "").strip()
-
-    lines = [VALIDATION_HEADING, "", HOW_VALIDATION_WORKS, ""]
-
-    artefacts = [
-        ("dummy dataset", state.get("semantic_dummy_dir")),
-        ("Python baseline output", state.get("semantic_python_output_path")),
-        ("PySpark output", state.get("semantic_pyspark_output_path")),
-    ]
-    artefacts = [(label, value) for label, value in artefacts if value]
-    if artefacts:
-        lines += ["**What it produced**", "", "| artefact | path |", "| --- | --- |"]
-        lines += [f"| {label} | `{value}` |" for label, value in artefacts]
-        lines.append("")
 
     status = "MATCH" if matched else "NO MATCH"
     lines.append(f"**Verdict: {status}**" + (f" — {message}" if message else ""))
@@ -131,9 +220,8 @@ def _validation_section(state) -> str:
         lines += ["", f"{len(differences)} difference(s) recorded{tail}:", ""]
         lines += [f"- {d}" for d in shown]
 
-    setup_error = state.get("semantic_setup_error")
-    if setup_error:
-        lines += ["", f"**Setup problem:** {setup_error}"]
+    if state.get("semantic_setup_error"):
+        lines += ["", f"**Setup problem:** {state['semantic_setup_error']}"]
 
     if not matched:
         lines += [
@@ -146,23 +234,17 @@ def _validation_section(state) -> str:
     return "\n".join(lines)
 
 
-def add_validation_notes_to_document(context: ToolContext) -> dict:
-    """Append the semantic-validation outcome to the migration document.
+def _append_validation_section(state) -> dict:
+    """Write the validation section into the document on disk.
 
-    Adds a short `## Semantic validation` section covering how the check works,
-    what it produced, and whether the two pipelines agreed.
-
-    Takes no arguments: everything it writes is already in state, recorded by the
-    semantic-validation agent. Call it after that agent has run — if no verdict
-    has been recorded yet it changes nothing and reports `skipped`. Calling it
-    again replaces the section rather than appending a second copy.
+    Shared by the tool and the after-agent callback so both behave identically,
+    and idempotent: a rerun replaces the section instead of stacking a copy.
     """
-    doc_path = context.state.get("documentation_file_path")
+    doc_path = state.get("documentation_file_path")
     if not doc_path:
-        # The document is always written next to the converted module, so its
-        # path is recoverable even if this tool runs in a session where
-        # `write_documentation_tool` never published the key.
-        converted = context.state.get("converted_pyspark_file_path")
+        # The document always sits next to the converted module, so its path is
+        # recoverable even when `write_documentation_tool` never published the key.
+        converted = state.get("converted_pyspark_file_path")
         if not converted:
             return {
                 "status": "error",
@@ -171,41 +253,44 @@ def add_validation_notes_to_document(context: ToolContext) -> dict:
         doc_path = str(pathlib.Path(str(converted)).with_name(DOC_FILENAME))
 
     path = pathlib.Path(doc_path)
-    if not path.exists():
-        return {
-            "status": "error",
-            "error": f"{path} does not exist — write the document before appending to it.",
-        }
-
-    if not context.state.get("semantic_match"):
-        return {
-            "status": "skipped",
-            "reason": (
-                "Semantic validation has not recorded a verdict yet, so there is "
-                "nothing to report. The document is unchanged."
-            ),
-        }
+    if not path.is_file():
+        return {"status": "error", "error": f"{path} does not exist — the document was never written."}
 
     try:
         existing = path.read_text(encoding="utf-8")
     except OSError as exc:
         return {"status": "error", "error": f"could not read {path}: {exc}"}
 
-    # Drop a previous run's section, anchored at a line start so the heading has
-    # to be a heading and not a mention of one inside the prose.
+    # Anchored at a line start, so the heading has to BE a heading and not a
+    # mention of one in the prose above.
     head = existing.split("\n" + VALIDATION_HEADING)[0].rstrip()
-    section = _validation_section(context.state)
 
     try:
-        path.write_text(head + "\n\n" + section + "\n", encoding="utf-8")
+        path.write_text(head + "\n\n" + _validation_section(state) + "\n", encoding="utf-8")
     except OSError as exc:
         return {"status": "error", "error": f"could not write {path}: {exc}"}
 
     return {
         "status": "success",
         "saved_file_path": str(path),
-        "match": bool((context.state.get("semantic_match") or {}).get("match")),
+        "validation_ran": _validation_has_run(state),
+        "match": bool((state.get("semantic_match") or {}).get("match")),
     }
+
+
+def add_validation_notes_to_document(context: ToolContext) -> dict:
+    """Append the semantic-validation outcome to the migration document.
+
+    Adds a `## Semantic validation` section: how the check works, what the
+    validator and code fixer each did, the artefacts they produced, and whether
+    the two pipelines matched.
+
+    Takes no arguments — everything it writes was recorded by the validation
+    stage. Calling it is optional: the same append runs automatically when this
+    agent finishes. Safe to call more than once; it replaces the section rather
+    than adding a second one.
+    """
+    return _append_validation_section(context.state)
 
 
 def seed_paths(callback_context: CallbackContext) -> None:
@@ -260,6 +345,33 @@ def discard_document_content(callback_context: CallbackContext) -> None:
                 continue
             if call.args and call.args.get("markdown"):
                 call.args["markdown"] = placeholder
+    return None
+
+
+def finalize_document(callback_context: CallbackContext) -> None:
+    """Append the validation section, then drop the document out of the session.
+
+    The append does NOT rely on the model calling
+    `add_validation_notes_to_document`, because it reliably did not: once
+    `write_documentation_tool` returns success the model treats the job as done
+    and ends its turn, so the instruction's follow-up step never ran and the
+    document shipped with no validation section at all. The tool stays for an
+    explicit request; this callback is what makes the section certain.
+
+    Order matters. The append reads `documentation_file_path` from state and the
+    document from disk — neither of which `discard_document_content` touches —
+    but the discard rewrites this agent's events, so run it last.
+    """
+    result = _append_validation_section(callback_context.state)
+    if result.get("status") == "success":
+        callback_context.state["documentation_validation_section_written"] = True
+    else:
+        # Surfaced in state rather than raised: a missing validation section is
+        # not worth failing a run that produced a good document.
+        callback_context.state["documentation_validation_section_error"] = str(
+            result.get("error", "")
+        )
+    discard_document_content(callback_context)
     return None
 
 
@@ -336,13 +448,13 @@ documentation_generator_agent = Agent(
     3. Call **write_documentation_tool(markdown=...)** ONCE with the complete
        document.
 
-    4. Call **add_validation_notes_to_document()** ONCE. It takes no arguments and
-       composes the semantic-validation section itself from the recorded verdict.
-       Do NOT write that section yourself in step 2, and do not describe the
-       validation outcome in your own words anywhere in the document — this tool
-       is the only thing that reports it. If it returns `skipped`, semantic
-       validation had not run yet; leave it at that and say nothing about
-       validation.
+    4. Do NOT write a semantic-validation section yourself in step 2, and do not
+       describe the validation outcome anywhere in the document. It is appended
+       automatically from the recorded verdict when you finish, and anything you
+       write about it will be a second, possibly contradictory account.
+       **add_validation_notes_to_document()** performs that same append on
+       demand if you want the section in place before you stop — optional, takes
+       no arguments, and safe to repeat.
 
     Then stop.
 
@@ -361,5 +473,5 @@ documentation_generator_agent = Agent(
     ],
     mode="task",
     include_contents="none",
-    after_agent_callback=discard_document_content,
+    after_agent_callback=finalize_document,
 )
