@@ -6,6 +6,7 @@ from google.adk.apps.app import EventsCompactionConfig
 from .subagents.code_parser import code_parser_agent
 from .subagents.conversion_loop import (
     conversion_loop_agent,
+    documentation_generator_agent,
     semantic_validation_loop_agent,
 )
 from .subagents.llm_call_logger import plugins as llm_log_plugins
@@ -18,13 +19,16 @@ root_agent = SequentialAgent(
         "inventory), runs the conversion loop that converts and fact-checks until "
         "the case facts match, runs the semantic-validation loop that compares "
         "Python vs PySpark outputs on a dummy dataset and fixes the converted code "
-        "until they match. The pytest parity suite is a separate app, run on "
-        "demand against the finished module rather than as a stage here."
+        "until they match, then documents the finished module — documentation runs "
+        "LAST so it describes the code as the semantic fixer left it, and can "
+        "report the validation verdict. The pytest parity suite is a separate app, "
+        "run on demand against the finished module rather than as a stage here."
     ),
     sub_agents=[
         code_parser_agent,
         conversion_loop_agent,
         semantic_validation_loop_agent,
+        documentation_generator_agent,
     ],
 )
 

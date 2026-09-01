@@ -1,2 +1,3 @@
 from .conversion_loop_agent import conversion_loop_agent
+from .documentation_generator_agent import documentation_generator_agent
 from .semantic_validation_agent import semantic_validation_loop_agent

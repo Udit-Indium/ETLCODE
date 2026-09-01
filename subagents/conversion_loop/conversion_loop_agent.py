@@ -2,7 +2,6 @@ from google.adk.agents import LoopAgent, SequentialAgent
 
 from .code_converter import code_convertor_agent
 from .case_fact_validation_agent import case_fact_checker_agent
-from .documentation_generator_agent import documentation_generator_agent
 
 code_convertor_loop_agent = LoopAgent(
     name="code_convertor_loop_agent",
@@ -27,8 +26,16 @@ code_convertor_loop_agent = LoopAgent(
     max_iterations=16,
 )
 
+# documentation_generator_agent used to be the second stage here. It now runs at
+# the END of the orchestrator, after semantic validation, for two reasons: the
+# semantic code fixer edits the converted module, so documenting it here
+# described code that was about to change; and the document's semantic-validation
+# section needs a verdict that did not exist yet at this point in the run.
+#
+# The wrapper is left in place with a single child: it is the name the
+# orchestrator imports, and it is where a later post-conversion stage would go.
 conversion_loop_agent = SequentialAgent(
     name="conversion_loop_agent",
     description="A sequential agent that orchestrates the code conversion and fact-checking process.",
-    sub_agents=[code_convertor_loop_agent, documentation_generator_agent]
+    sub_agents=[code_convertor_loop_agent]
 )
