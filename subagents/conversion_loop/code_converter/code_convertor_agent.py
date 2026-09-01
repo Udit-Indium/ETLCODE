@@ -1327,92 +1327,163 @@ def _persist_execution_state(context: ToolContext, result: dict) -> dict:
     context.state["pyspark_execution_error"] = result.get("error", "")
     return result
 
-def execute_pyspark_script_tool(context: ToolContext) -> dict:
+def execute_pyspark_script_tool(
+    context: ToolContext,
+    dependencies: list[str] | None = None,
+) -> dict:
     """Run the converted PySpark file on Databricks to catch syntax/runtime errors.
 
-    Uploads the current converted file (path read from state) to the Databricks
-    workspace as a notebook, submits it to serverless compute, waits for the run
-    to finish, and deletes the uploaded notebook. Returns a compact dict so the
-    agent can decide whether to fix and retry — the raw Databricks payload is
-    NOT returned in full (it is large and would flood the context window).
+    Uploads the current converted file to the Databricks workspace as a notebook,
+    submits it to Databricks Serverless compute with the dependencies supplied
+    by the LLM, waits for the run to finish, and deletes the uploaded notebook.
+
+    Args:
+        context: Tool execution context.
+        dependencies: Python/PyPI dependencies required by the generated script.
+            Example:
+                ["openpyxl==3.1.5"]
+
+            Multiple dependencies can be supplied:
+                [
+                    "databricks-sql-connector==4.1.2",
+                    "databricks-sdk==0.62.0",
+                    "openpyxl==3.1.5",
+                    "xlsxwriter==3.2.5"
+                ]
+
+    Returns:
+        Compact execution result for the agent.
     """
-    python_script_path = context.state.get("converted_pyspark_file_path")
+
+    python_script_path = context.state.get(
+        "converted_pyspark_file_path"
+    )
+
     if not python_script_path:
-        return _persist_execution_state(context, {
-            "success": False,
-            "error": "No converted PySpark file found in state. Call add_converted_functions_tool first.",
-        })
+        return _persist_execution_state(
+            context,
+            {
+                "success": False,
+                "error": (
+                    "No converted PySpark file found in state. "
+                    "Call add_converted_functions_tool first."
+                ),
+            },
+        )
 
     python_script_path = str(python_script_path)
 
+    if dependencies is None:
+        dependencies = []
+
+    dependencies = list(dict.fromkeys(dependencies))
+
     file_name = f"generated_{uuid.uuid4().hex}.py"
-    workspace_path = f"/Workspace/Users/{USER}@shell.com/Drafts/{file_name}"
-    # Read before the try block, so guard it separately: an unreadable file here
-    # would otherwise escape as an exception instead of a tool result.
+
+    workspace_path = (
+        f"/Workspace/Users/{USER}@shell.com/Drafts/{file_name}"
+    )
+
     try:
-        # Explicit encoding: the platform default is cp1252 on Windows, which
-        # cannot read the non-ASCII characters a converted file may carry.
-        with open(python_script_path, "r", encoding="utf-8") as file:
+
+        with open(
+            python_script_path,
+            "r",
+            encoding="utf-8",
+        ) as file:
             code = file.read()
+
     except OSError as exc:
-        return _persist_execution_state(context, {
-            "success": False,
-            "file_path": python_script_path,
-            "error": f"Could not read the converted file: {exc}",
-        })
+
+        return _persist_execution_state(
+            context,
+            {
+                "success": False,
+                "file_path": python_script_path,
+                "error": f"Could not read the converted file: {exc}",
+            },
+        )
+
     timeout = 600
 
     try:
         upload_payload = {
-            "path":workspace_path,
-            "format":"SOURCE",
-            "language":"PYTHON",
-            "overwrite":True,
-            "content":base64.b64encode(code.encode()).decode()
+            "path": workspace_path,
+            "format": "SOURCE",
+            "language": "PYTHON",
+            "overwrite": True,
+            "content": base64.b64encode(
+                code.encode("utf-8")
+            ).decode("utf-8"),
         }
 
         r = requests.post(
             f"{HOST}/api/2.0/workspace/import",
             headers=HEADERS,
-            json=upload_payload
+            json=upload_payload,
         )
 
         if not r.ok:
-            return _persist_execution_state(context, {
-                "success": False,
-                "file_path": python_script_path,
-                "status_code": r.status_code,
-                "error": _tail(r.text, 1000),
-            })
+
+            return _persist_execution_state(
+                context,
+                {
+                    "success": False,
+                    "file_path": python_script_path,
+                    "status_code": r.status_code,
+                    "error": _tail(r.text, 1000),
+                },
+            )
+
         r.raise_for_status()
 
         submit_payload = {
-            "run_name":"varification",
-            "tasks":[
-                {
-                    "task_key":"execute",
-                    "notebook_task":{
-                        "notebook_path":workspace_path,
-                    },
-                    "environment_key":"default_python"
-                }
+            "run_name": "verification",
 
-            ],
-            "environments":[
+            "tasks": [
                 {
-                    "environment_key":"default_python",
-                    "spec":{
-                        "environment_version":"4"
-                    }
+                    "task_key": "execute",
+
+                    "notebook_task": {
+                        "notebook_path": workspace_path,
+                    },
+
+                    "environment_key": "default_python",
                 }
-            ]
+            ],
+
+            "environments": [
+                {
+                    "environment_key": "default_python",
+
+                    "spec": {
+                        "environment_version": "4",
+
+                        # Dependencies supplied by the LLM
+                        "dependencies": dependencies,
+                    },
+                }
+            ],
         }
 
         r = requests.post(
             f"{HOST}/api/2.2/jobs/runs/submit",
             headers=HEADERS,
-            json=submit_payload
+            json=submit_payload,
         )
+
+        if not r.ok:
+
+            return _persist_execution_state(
+                context,
+                {
+                    "success": False,
+                    "file_path": python_script_path,
+                    "status_code": r.status_code,
+                    "error": _tail(r.text, 2000),
+                    "dependencies": dependencies,
+                },
+            )
 
         r.raise_for_status()
 
@@ -1421,94 +1492,186 @@ def execute_pyspark_script_tool(context: ToolContext) -> dict:
         start = time.time()
 
         while True:
+
             r = requests.get(
                 f"{HOST}/api/2.2/jobs/runs/get",
                 headers=HEADERS,
-                params={"run_id": run_id},
+                params={
+                    "run_id": run_id
+                },
             )
 
             r.raise_for_status()
+
             info = r.json()
-            task = info["tasks"][0]
+
+            tasks = info.get("tasks", [])
+
+            if not tasks:
+
+                return _persist_execution_state(
+                    context,
+                    {
+                        "success": False,
+                        "file_path": python_script_path,
+                        "run_id": run_id,
+                        "dependencies": dependencies,
+                        "error": (
+                            "Databricks returned no tasks "
+                            "for the run."
+                        ),
+                    },
+                )
+
+            task = tasks[0]
+
             task_run_id = task["run_id"]
+
             state = task["state"]["life_cycle_state"]
 
-            if state in ["TERMINATED", "INTERNAL_ERROR", "SKIPPED"]:
+            if state in [
+                "TERMINATED",
+                "INTERNAL_ERROR",
+                "SKIPPED",
+            ]:
                 break
 
-            if time.time()-start>timeout:
-                return _persist_execution_state(context, {
-                    "success": False,
-                    "file_path": python_script_path,
-                    "status": "TIMEOUT",
-                    "run_id": run_id,
-                    "life_cycle_state": state,
-                })
+            if time.time() - start > timeout:
+
+                return _persist_execution_state(
+                    context,
+                    {
+                        "success": False,
+                        "file_path": python_script_path,
+                        "status": "TIMEOUT",
+                        "run_id": run_id,
+                        "life_cycle_state": state,
+                        "dependencies": dependencies,
+                    },
+                )
 
             time.sleep(5)
 
         r = requests.get(
             f"{HOST}/api/2.2/jobs/runs/get-output",
             headers=HEADERS,
-            params={"run_id":task_run_id}
+            params={
+                "run_id": task_run_id
+            },
         )
+
+        r.raise_for_status()
+
         output = r.json()
 
-        status = info["state"].get("result_state")
+        status = info["state"].get(
+            "result_state"
+        )
+
         success = status == "SUCCESS"
+
         out = {
             "success": success,
             "file_path": python_script_path,
             "status": status,
             "run_id": run_id,
             "life_cycle_state": state,
+            "dependencies": dependencies,
         }
+
         if not success:
+
             error_text = output.get("error") or ""
+
             trace = output.get("error_trace") or ""
-            out["error"] = _tail(error_text)
-            out["error_summary"] = _error_summary(trace or error_text, python_script_path)
-            missing = _unavailable_module(f"{trace}\n{error_text}")
+
+            out["error"] = _tail(
+                error_text,
+                2000,
+            )
+
+            out["error_summary"] = _error_summary(
+                trace or error_text,
+                python_script_path,
+            )
+
+            missing = _unavailable_module(
+                f"{trace}\n{error_text}"
+            )
+
             if missing:
-                # Terminal, not flaky: re-running cannot install a desktop
-                # application onto a cluster. Say so explicitly, because the
-                # generic "read error_summary and fix the broken piece"
-                # instruction otherwise reads as "retry the same code".
-                out["fatal"] = True
+
                 out["unavailable_module"] = missing
-                out["action_required"] = (
-                    f"`{missing}` does not exist on Databricks and never will — "
-                    f"it drives a local desktop application, so no cluster can "
-                    f"import it. DO NOT re-run this script and DO NOT retry the "
-                    f"import. Rewrite the offending function(s) now with "
-                    f"{UNAVAILABLE_ON_DATABRICKS[missing]} using "
-                    f"replace_functions_tool, then run once more. Excel reads "
-                    f"become `pandas.read_excel(path, sheet_name=...)`; writes "
-                    f"become `pandas.DataFrame.to_excel(path, sheet_name=..., "
-                    f"index=False)` or an `openpyxl` workbook. Keep the same "
-                    f"file paths, sheet names, and cell ranges as the source."
-                )
-        return _persist_execution_state(context, out)
+                dependency_names = {
+                    dep.split("==")[0]
+                    .split(">=")[0]
+                    .split("<=")[0]
+                    .split("~=")[0]
+                    .strip()
+                    for dep in dependencies
+                }
+
+                if missing in dependency_names:
+
+                    out["fatal"] = False
+
+                    out["action_required"] = (
+                        f"`{missing}` was supplied as a serverless "
+                        f"dependency, but Databricks could not import it. "
+                        f"Check the serverless dependency installation "
+                        f"logs and verify that the package/version is "
+                        f"compatible with the Databricks runtime."
+                    )
+
+                else:
+
+                    out["fatal"] = True
+
+                    out["action_required"] = (
+                        f"`{missing}` is not available in the current "
+                        f"Databricks environment and was not supplied "
+                        f"as a dependency. Add the required PyPI package "
+                        f"to the `dependencies` argument and execute "
+                        f"the script again. Do not rewrite the generated "
+                        f"code solely because the package is missing."
+                    )
+
+        return _persist_execution_state(
+            context,
+            out,
+        )
 
     except Exception as exc:
-        return _persist_execution_state(context, {
-            "success": False,
-            "file_path": python_script_path,
-            "error": f"Databricks execution failed: {type(exc).__name__}: {exc}",
-        })
+
+        return _persist_execution_state(
+            context,
+            {
+                "success": False,
+                "file_path": python_script_path,
+                "dependencies": dependencies,
+                "error": (
+                    f"Databricks execution failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            },
+        )
 
     finally:
         try:
+
             requests.post(
                 f"{HOST}/api/2.0/workspace/delete",
                 headers=HEADERS,
                 json={
-                    "path":workspace_path,
-                    "recursive":False,
+                    "path": workspace_path,
+                    "recursive": False,
                 },
             )
+
             print("workspace_deleted")
-        except Exception as ex:
+
+        except Exception:
+
             print("cleanup failed")
 
 
@@ -1752,9 +1915,9 @@ semantic_code_fixer_agent = Agent(
     editing ONLY the functions responsible for the differences — surgically, in batches.
 
     MANDATORY conversion conventions: use the **py2snow-skill** through the SkillToolset
-    for native Spark rules. Do not reproduce the full skill/reference corpus in context.
-    Never introduce pandas idioms (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`)
-    or numpy column-building patterns into the corrected code.
+    for Spark rules. Make sure you loads the pyspark conventions with `load_skill_resource` before
+    converting any code. Never introduce pandas idioms (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, 
+    `df.apply`) or numpy column-building patterns into the corrected code.
 
     Semantic comparison verdict (differences between the two outputs — these describe
     columns/values, so reason about WHICH function produces each differing column):

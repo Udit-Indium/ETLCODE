@@ -16,6 +16,11 @@ from google.adk.tools.tool_context import ToolContext
 
 DOC_FILENAME = "MIGRATION_DOCUMENTATION.md"
 
+#: What replaces the document once it is safely on disk. Keeps the function call
+#: in the transcript readable without carrying the payload — see
+#: `discard_document_content`.
+DOC_PLACEHOLDER = "<document omitted from history — it was written to {path}>"
+
 
 def read_file_tool(context: ToolContext, path: str) -> dict:
     """Read a file from disk and return its text.
@@ -77,6 +82,47 @@ def seed_paths(callback_context: CallbackContext) -> None:
     return None
 
 
+def discard_document_content(callback_context: CallbackContext) -> None:
+    """Drop the finished document out of the session once it is on disk.
+
+    The document is this agent's whole output, and it reached
+    `write_documentation_tool` as a function-call ARGUMENT — so it lives in this
+    agent's events. ADK relays one agent's events into the next agent's request
+    verbatim: `_present_other_agent_message` renders them as "[agent] called tool
+    `write_documentation_tool` with parameters: <the entire document>". The
+    semantic-validation loop that runs next works from the converted FILE and
+    never reads the document, so leaving it in place only pays for a full
+    migration document in every prompt after this point (and in whatever the
+    event compactor then summarises).
+
+    So: rewrite the argument to a one-line pointer at the saved file. The file is
+    the artefact; the only thing published to state is its path,
+    `documentation_file_path`.
+
+    Two limits worth knowing. This edits the in-memory event list, which is what
+    the request builder reads — a session reloaded from a persistent session
+    service would bring the original argument back. And the agent's own text
+    turns are left untouched: they are short summaries, and the instruction has
+    the document going through the tool, not through the reply.
+    """
+    invocation = getattr(callback_context, "_invocation_context", None)
+    session = getattr(invocation, "session", None)
+    saved = callback_context.state.get("documentation_file_path") or "disk"
+    placeholder = DOC_PLACEHOLDER.format(path=saved)
+
+    for event in getattr(session, "events", None) or ():
+        if getattr(event, "author", None) != callback_context.agent_name:
+            continue
+        content = getattr(event, "content", None)
+        for part in getattr(content, "parts", None) or ():
+            call = getattr(part, "function_call", None)
+            if not call or call.name != "write_documentation_tool":
+                continue
+            if call.args and call.args.get("markdown"):
+                call.args["markdown"] = placeholder
+    return None
+
+
 documentation_generator_agent = Agent(
     name="documentation_generator_agent",
     model=LiteLlm(
@@ -114,11 +160,12 @@ documentation_generator_agent = Agent(
        module-level constants. Name anything present in the source and absent from the
        converted file.
 
-       `## Function-by-function mapping`
+       `## Function-by-function, Class by Class, Constant by Constant, or file may be refactored as well if input file is ipynb file`
        A table: source function | what it does | converted function | status
        (converted / missing / changed) | notes. One row per source function. Add rows
        for converted functions that have NO source counterpart (helpers introduced by
        the conversion) and mark them as such.
+       If the script is a jupyter notebbok then check which lines are combined to form a function and what it is covering.
 
        `## Gaps and differences`
        Everything a human still has to resolve: functions not converted, stubs or
@@ -162,6 +209,5 @@ documentation_generator_agent = Agent(
     ],
     mode="task",
     include_contents="none",
-    output_key="documentation_generator_output",
-    before_agent_callback=seed_paths,
+    after_agent_callback=discard_document_content,
 )

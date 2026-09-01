@@ -16,7 +16,16 @@ module. The output is a SINGLE file, `<stem>_spark.py`, assembled batch by batch
 by `add_converted_functions_tool` — never several files. All the conventions to
 follow when converting are in `references/`.
 
-— **read all reference files before converting and follow them exactly.**
+— **Loading this SKILL.md does NOT load the references.** Before converting any
+code, load them yourself with
+`load_skill_resource(skill_name="py2snow-skill", file_path="references/<file>")`:
+- `references/pyspark_etl_conventions.md` — **mandatory on every conversion
+  run**, before the first batch. Its §0 holds the binding rules: distributed
+  pipelines (§0.4), Spark read/write I/O (§0.6), the SparkSession (§0.7).
+- `references/SEMS_Compliance.md` — mandatory.
+- `references/pyspark_visualisations_conventions.md` — only if the source plots.
+
+Follow them exactly; never convert a function from memory of them.
 
 The skill is generic: it must work for **any** input set. Never hardcode columns,
 functions, or a pipeline — drive everything off the inputs.
@@ -82,7 +91,8 @@ graph is ambiguous about the hand-off, read the original orchestrator function
 with **read_source_functions_tool** and follow it exactly. Confirm the inventory
 and the call graph reconcile.
 
-**STEP 4 — Read the conventions.** Read **all** files in `references/`:
+**STEP 4 — Load the conventions** with `load_skill_resource` (see the top of this
+file for the exact call). Read **all** files in `references/`:
 - `pyspark_etl_conventions.md` — HOW to convert: function counting, flow
   recovery, pandas→Spark mapping, and divergence traps.
 - `SEMS_Compliance.md` — docstrings (incl. module `Inputs:`/`Outputs:`),
@@ -123,9 +133,16 @@ classes and main method in the file.
 - Apply SEMS throughout: docstring on every function naming its source function,
   inline comments mapping source tags, `logging` not `print`, same exceptions, no
   hardcoded secrets.
-- Use the DataFrame API only (no row loops, no driver collects, no plain
-  `F.udf`); expose `get_spark()` with a UTC session time zone so the module runs
-  locally and on Databricks.
+- **Spark read/write only** (ETL conventions §0.6): `spark.read…`/`spark.table`/
+  `spark.sql` in, `df.write…`/`.saveAsTable` out — never `pd.read_*`, `to_csv`/
+  `to_parquet`/`to_sql`, `open()`-for-data, a DB cursor, or
+  `createDataFrame(pd.read_csv(...))`. Excel per §0.5 is the only exception.
+- **Use `get_spark()`, don't just define it** (§0.7): the orchestrator opens the
+  session once and passes `spark: SparkSession` into every function that reads,
+  writes or calls `createDataFrame`. Defined-but-never-called = failed conversion.
+- **Distributed pipeline** (§0.4): DataFrame API only, driver empty between read
+  and write — no row loops, collects, `.rdd`, plain `F.udf`, dict lookups where a
+  join belongs, or `count()` guards.
 Save it with **add_converted_functions_tool(functions_code=...)**, passing ONLY the
 batch you converted this turn. The tool owns the output path and reassembles the
 file deterministically — you never name a file and never resend earlier batches.
@@ -311,6 +328,8 @@ exactly:
 - **Flow == the source's call order** — same functions, same order, repeated
   calls kept, frames threaded between steps as the original did.
 - **Distributed DataFrame API** — no row loops, no driver collects, no plain `F.udf`.
+- **Spark reader/writer for all I/O** — `spark.read`/`spark.table`/`spark.sql` in,
+  `df.write`/`.saveAsTable` out; no pandas, `open()` or cursor I/O (Excel excepted).
 - **Behaviour preserved** — translation, not rewrite; no new logic.
 - **Executed clean** — run **execute_pyspark_script_tool()** once the whole file
   is assembled, and loop on fixes until it runs without error. There is no local
@@ -334,5 +353,7 @@ exactly:
   convention, DBFS/cloud-only paths, expression term count ≤5, no unrelated
   parameter reassignment, no dead `self.x` attributes, lint-clean formatting
   (see `SEMS_Compliance.md` §9).
-- **Proper SparkSession** — `get_spark()`, UTC tz, runnable locally and on cluster.
+- **Proper SparkSession** — `get_spark()`, UTC tz, runnable locally and on
+  cluster, and **actually called** (≥1 call site, threaded into the functions
+  that need it).
 - **Generic** — never assume the reference pipeline; drive everything off the inputs.

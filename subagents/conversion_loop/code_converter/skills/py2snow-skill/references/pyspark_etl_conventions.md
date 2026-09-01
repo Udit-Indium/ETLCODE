@@ -17,7 +17,7 @@ Two inputs, three jobs:
 
 ---
 
-## 0. The five hard rules (non-negotiable)
+## 0. The seven hard rules (non-negotiable)
 
 1. **Convert EVERY constants, function and EVERY class — no exceptions, no placeholders.**
    The converted constant counts and callable count must **equal** the parsed-JSON inventory. 
@@ -32,11 +32,18 @@ Two inputs, three jobs:
 3. **Preserve behaviour exactly (functional equivalence).** Same inputs → same
    outputs as the original. Do not add, drop, reorder, or "improve" business
    logic. The converted code is a *translation*, not a rewrite.
-4. **Distributed DataFrame API, driven by the inputs.** Use the DataFrame API
-   and column expressions — no row loops, no `.collect()`/`.toPandas()` inside a
-   transform, **no plain `F.udf`** unless there is truly no built-in. Every
-   column name, join key, group key, filter literal and window spec comes from
-   the **parsed JSON + source, used verbatim** — never invented or renamed.
+4. **Distributed DataFrame API, driven by the inputs.** Read → chained DataFrame
+   transformations → write, with nothing materialised on the driver in between.
+   No row loops, no `.collect()`/`.toPandas()`/`.rdd`/`.toLocalIterator()` inside
+   a transform, no per-row Python (`apply(axis=1)`), **no plain `F.udf`** unless
+   there is truly no built-in. A Python dict/list built from one frame to look
+   values up in another is a **join** (broadcast the small side); a frame grown in
+   a loop is `reduce(DataFrame.unionByName, frames)`; `df.count()`/`len(df)` as a
+   guard is `df.limit(1).count() == 0`, and column checks use `df.columns`/
+   `df.schema` (metadata — no job). Looping over metadata to build column
+   expressions and applying them in one `select` IS distributed and is fine.
+   Every column name, join key, group key, filter literal and window spec comes
+   from the **parsed JSON + source, used verbatim** — never invented or renamed.
 
 5. **Never emit a library that needs a desktop application.** `xlwings`,
    `win32com`, `pywin32` and `xlsxwriter` drive a local Excel/Windows process
@@ -61,6 +68,32 @@ Two inputs, three jobs:
    sheet with pandas, then hand it to `spark.createDataFrame(...)` and do the
    actual transformation in Spark; collect a **small** aggregate back before
    writing. Never pull a full distributed frame to the driver just to write it.
+
+6. **All data I/O goes through the Spark reader/writer.** Every source read
+   becomes `spark.read.format(...).option(...).schema(SCHEMA).load(path)` (or the
+   `.csv/.parquet/.json` shorthands), `spark.table("catalog.schema.table")`,
+   `spark.sql(query)`, or `spark.read.format("jdbc")…`. Every source write becomes
+   `df.write.mode(...).format(...).save(path)`, `.saveAsTable(...)` or
+   `.insertInto(...)`. **Never** `pd.read_csv/read_parquet/read_json/read_sql`,
+   `open()`+`csv`/`json` to build rows, `df.to_csv/to_parquet/to_json/to_sql`, a
+   `sqlalchemy`/`pyodbc`/`psycopg2` cursor, or `spark.createDataFrame(pd.read_csv(path))`
+   (a driver read in a Spark wrapper). Excel (rule 5) is the only exception.
+   `createDataFrame` is only for rows the source itself builds in Python.
+   Paths, table names, formats, options and write modes verbatim; prefer an
+   explicit `T.StructType` over `inferSchema`; keep I/O at the edges (loaders read,
+   writers write, transforms are DataFrame-in/DataFrame-out).
+
+7. **`get_spark()` must be CALLED, not just defined** — a module that declares it
+   and never uses it cannot read, write or create a frame, and is a FAILED
+   conversion. The orchestrator opens the session on its first line
+   (`spark = get_spark()`) and threads it down: every function that reads, writes
+   or calls `createDataFrame`/`spark.sql`/`spark.table` takes `spark: SparkSession`
+   as its FIRST parameter — the ONE permitted signature change (all other
+   parameters and the function name stay verbatim). A function that cannot be
+   handed one calls `get_spark()` itself (`getOrCreate()` returns the same
+   session). `SparkSession.builder` appears only inside `get_spark()`; never a
+   module-level session. Check before finishing: `get_spark` must appear at least
+   twice in the file — its `def` plus ≥1 call site.
 
 ---
 
@@ -302,6 +335,10 @@ Handle each explicitly; these pass a smoke test but corrupt results:
 - [ ] Orchestrator flow **==** the source's call order (same order, repeated calls kept, frames threaded as the original orchestrator threads them).
 - [ ] Every column / key / literal / window spec taken **verbatim** from parsed JSON + source.
 - [ ] Distributed DataFrame API throughout; no row loops, no driver collects, no plain `F.udf`.
+- [ ] Every read is `spark.read…`/`spark.table`/`spark.sql`, every write is
+      `df.write…`/`.saveAsTable` (rule 6) — no pandas/`open()`/cursor I/O.
+- [ ] `get_spark()` has ≥1 call site and the session is threaded into the
+      functions that need it (rule 7).
 - [ ] Each high-risk construct (`merge_asof`, rolling, `qcut`, dedup-keep, explode-empty) handled per §4–§5.
 - [ ] Module exposes a proper `get_spark()`/`SparkSession`; UTC session tz; no I/O inside transforms.
 - [ ] SEMS compliance per `SEMS_Compliance.md`; any plotting per `pyspark_visualisations_conventions.md`.

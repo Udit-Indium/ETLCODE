@@ -335,7 +335,10 @@ def _run_pyspark_runner(module_path: "str | None" = None) -> dict:
                     {
                         "environment_key": "default_python",
                         "spec": {
-                            "environment_version": "4"
+                            "environment_version": "4",
+                            "dependencies": [
+                            "openpyxl==3.1.5"
+                        ],
                         },
                     }
                 ],
